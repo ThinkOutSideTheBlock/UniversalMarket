@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
 interface IUniversalNFT {
     function initialize(
         string memory name,
@@ -8,12 +11,6 @@ interface IUniversalNFT {
     ) external;
 
     function mint(address to) external returns (uint256);
-
     function transferFrom(address from, address to, uint256 tokenId) external;
-
-    function transferOwnership(address newOwner) external; // Add this
-
-    function ownerOf(uint256 tokenId) external view returns (address);
-
-    function approve(address to, uint256 tokenId) external;
+    function transferOwnership(address newOwner) external;
 }

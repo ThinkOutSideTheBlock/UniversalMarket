@@ -7,11 +7,20 @@ import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 interface IEmergencyControls {
     function isContractPaused(
         address contractAddr
     ) external view returns (bool);
+}
+
+interface IRoyaltyDistributor {
+    function initialize(address fractionToken) external;
+    function depositRoyalties(
+        address fractionToken,
+        bytes32 merkleRoot
+    ) external payable;
 }
 
 contract FractionToken is
@@ -21,12 +30,15 @@ contract FractionToken is
     PausableUpgradeable,
     IERC721Receiver
 {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
     // Constants
     uint256 private constant MIN_OWNERSHIP_PERCENT = 20;
     uint256 private constant EXECUTE_THRESHOLD_PERCENT = 51;
     uint256 private constant BUYOUT_DURATION = 7 days;
     uint256 private constant FLASH_LOAN_PROTECTION = 1 hours;
     uint256 private constant PERCENT_DENOMINATOR = 100;
+    uint256 private constant MAX_SLIPPAGE = 1000; // 10%
 
     // State variables
     address public nftContract;
@@ -34,6 +46,16 @@ contract FractionToken is
     uint256 public buyoutPrice;
     bool public redeemed;
     IEmergencyControls public emergencyControls;
+    IRoyaltyDistributor public royaltyDistributor;
+
+    // Asset metadata
+    uint8 public assetCategory;
+    string public metadataURI;
+    mapping(string => string) public assetAttributes;
+    string[] public attributeKeys;
+
+    // Holder tracking - FIXED
+    EnumerableSet.AddressSet private holders;
 
     struct Buyout {
         address proposer;
@@ -44,6 +66,7 @@ contract FractionToken is
         bool cancelled;
         mapping(address => uint256) escrowedFractions;
         uint256 totalEscrowed;
+        mapping(address => uint256) refundAmounts;
     }
 
     Buyout public currentBuyout;
@@ -64,19 +87,26 @@ contract FractionToken is
     );
     event BuyoutExecuted(address indexed proposer, uint256 totalPrice);
     event BuyoutCancelled(address indexed proposer, string reason);
-    event BuyoutRefunded(address indexed user, uint256 fractions);
+    event BuyoutRefunded(
+        address indexed user,
+        uint256 fractions,
+        uint256 ethAmount
+    );
     event NFTRedeemed(address indexed redeemer);
     event EmergencyControlsSet(address indexed controls);
+    event RoyaltyDistributorSet(address indexed distributor);
+    event AssetAttributeSet(string key, string value);
+    event RoyaltyDeposited(uint256 amount, bytes32 merkleRoot);
 
     // Modifiers
     modifier notPaused() {
         if (address(emergencyControls) != address(0)) {
             require(
                 !emergencyControls.isContractPaused(address(this)),
-                "Contract is paused"
+                "Emergency paused"
             );
         }
-        require(!paused(), "Contract is paused");
+        require(!paused(), "Contract paused");
         _;
     }
 
@@ -84,6 +114,11 @@ contract FractionToken is
         require(currentBuyout.deadline > block.timestamp, "No active buyout");
         require(!currentBuyout.executed, "Buyout already executed");
         require(!currentBuyout.cancelled, "Buyout cancelled");
+        _;
+    }
+
+    modifier validSlippage(uint256 slippage) {
+        require(slippage <= MAX_SLIPPAGE, "Slippage too high");
         _;
     }
 
@@ -95,7 +130,9 @@ contract FractionToken is
         uint256 _totalSupply,
         address _owner,
         uint256 _liquidityAmount,
-        address _liquidityRecipient
+        address _liquidityRecipient,
+        uint8 _assetCategory,
+        string memory _metadataURI
     ) external initializer {
         __ERC20_init(name, symbol);
         __Ownable_init(_owner);
@@ -104,19 +141,24 @@ contract FractionToken is
 
         require(_nftContract != address(0), "Invalid NFT contract");
         require(_totalSupply > 0, "Invalid total supply");
+        require(_owner != address(0), "Invalid owner");
 
         nftContract = _nftContract;
         tokenId = _tokenId;
+        assetCategory = _assetCategory;
+        metadataURI = _metadataURI;
 
         // Mint liquidity tokens to recipient
         if (_liquidityAmount > 0 && _liquidityRecipient != address(0)) {
             _mint(_liquidityRecipient, _liquidityAmount);
+            holders.add(_liquidityRecipient);
         }
 
         // Mint remaining tokens to owner
         uint256 userTokens = _totalSupply - _liquidityAmount;
         if (userTokens > 0) {
             _mint(_owner, userTokens);
+            holders.add(_owner);
         }
 
         _transferOwnership(_owner);
@@ -126,6 +168,39 @@ contract FractionToken is
         require(_controls != address(0), "Invalid controls");
         emergencyControls = IEmergencyControls(_controls);
         emit EmergencyControlsSet(_controls);
+    }
+
+    function setRoyaltyDistributor(address _distributor) external onlyOwner {
+        require(_distributor != address(0), "Invalid distributor");
+        royaltyDistributor = IRoyaltyDistributor(_distributor);
+        emit RoyaltyDistributorSet(_distributor);
+    }
+
+    function setAssetAttribute(
+        string calldata key,
+        string calldata value
+    ) external onlyOwner {
+        if (bytes(assetAttributes[key]).length == 0) {
+            attributeKeys.push(key);
+        }
+        assetAttributes[key] = value;
+        emit AssetAttributeSet(key, value);
+    }
+
+    function depositRoyalties(
+        bytes32 merkleRoot
+    ) external payable nonReentrant {
+        require(msg.value > 0, "No ETH sent");
+        require(
+            address(royaltyDistributor) != address(0),
+            "No royalty distributor"
+        );
+
+        royaltyDistributor.depositRoyalties{value: msg.value}(
+            address(this),
+            merkleRoot
+        );
+        emit RoyaltyDeposited(msg.value, merkleRoot);
     }
 
     function pause() external onlyOwner {
@@ -146,8 +221,9 @@ contract FractionToken is
     }
 
     function proposeBuyout(
-        uint256 pricePerFraction
-    ) external payable nonReentrant notPaused {
+        uint256 pricePerFraction,
+        uint256 maxSlippage
+    ) external payable nonReentrant notPaused validSlippage(maxSlippage) {
         require(
             balanceOf(msg.sender) >=
                 (totalSupply() * MIN_OWNERSHIP_PERCENT) / PERCENT_DENOMINATOR,
@@ -174,19 +250,24 @@ contract FractionToken is
         }
 
         // Initialize new buyout
-        Buyout storage newBuyout = currentBuyout;
-        newBuyout.proposer = msg.sender;
-        newBuyout.pricePerFraction = pricePerFraction;
-        newBuyout.totalOffered = msg.value;
-        newBuyout.deadline = block.timestamp + BUYOUT_DURATION;
-        newBuyout.executed = false;
-        newBuyout.cancelled = false;
-        newBuyout.totalEscrowed = balanceOf(msg.sender);
+        _resetBuyoutState();
 
-        // Escrow proposer's fractions
-        newBuyout.escrowedFractions[msg.sender] = balanceOf(msg.sender);
+        currentBuyout.proposer = msg.sender;
+        currentBuyout.pricePerFraction = pricePerFraction;
+        currentBuyout.totalOffered = msg.value;
+        currentBuyout.deadline = block.timestamp + BUYOUT_DURATION;
+        currentBuyout.executed = false;
+        currentBuyout.cancelled = false;
 
-        emit BuyoutProposed(msg.sender, pricePerFraction, newBuyout.deadline);
+        uint256 proposerBalance = balanceOf(msg.sender);
+        currentBuyout.totalEscrowed = proposerBalance;
+        currentBuyout.escrowedFractions[msg.sender] = proposerBalance;
+
+        emit BuyoutProposed(
+            msg.sender,
+            pricePerFraction,
+            currentBuyout.deadline
+        );
     }
 
     function acceptBuyout(
@@ -204,6 +285,7 @@ contract FractionToken is
 
         // Calculate payment
         uint256 payment = fractions * buyout.pricePerFraction;
+        buyout.refundAmounts[msg.sender] += payment;
 
         // Transfer payment to acceptor
         (bool success, ) = payable(msg.sender).call{value: payment}("");
@@ -245,15 +327,13 @@ contract FractionToken is
             buyout.totalEscrowed >=
             (totalSupply() * EXECUTE_THRESHOLD_PERCENT) / PERCENT_DENOMINATOR
         ) {
-            // Transfer all escrowed fractions to proposer
-            for (uint i = 0; i < totalSupply(); i++) {
-                address holder = address(uint160(i)); // This is simplified, need proper tracking
-                if (buyout.escrowedFractions[holder] > 0) {
-                    _transfer(
-                        holder,
-                        buyout.proposer,
-                        buyout.escrowedFractions[holder]
-                    );
+            // Transfer all escrowed fractions to proposer - FIXED LOGIC
+            uint256 holderCount = holders.length();
+            for (uint256 i = 0; i < holderCount; i++) {
+                address holder = holders.at(i);
+                uint256 escrowedAmount = buyout.escrowedFractions[holder];
+                if (escrowedAmount > 0 && holder != buyout.proposer) {
+                    _transfer(holder, buyout.proposer, escrowedAmount);
                 }
             }
 
@@ -288,10 +368,20 @@ contract FractionToken is
     function claimRefund() external nonReentrant {
         require(currentBuyout.cancelled, "Buyout not cancelled");
         uint256 escrowed = currentBuyout.escrowedFractions[msg.sender];
-        require(escrowed > 0, "No refund available");
+        uint256 refundAmount = currentBuyout.refundAmounts[msg.sender];
+        require(escrowed > 0 || refundAmount > 0, "No refund available");
 
         currentBuyout.escrowedFractions[msg.sender] = 0;
-        emit BuyoutRefunded(msg.sender, escrowed);
+        currentBuyout.refundAmounts[msg.sender] = 0;
+
+        if (refundAmount > 0) {
+            (bool success, ) = payable(msg.sender).call{value: refundAmount}(
+                ""
+            );
+            require(success, "Refund transfer failed");
+        }
+
+        emit BuyoutRefunded(msg.sender, escrowed, refundAmount);
     }
 
     function redeemNFT() external nonReentrant notPaused {
@@ -303,9 +393,20 @@ contract FractionToken is
 
         redeemed = true;
         _burn(msg.sender, totalSupply());
+        holders.remove(msg.sender);
 
         IERC721(nftContract).transferFrom(address(this), msg.sender, tokenId);
         emit NFTRedeemed(msg.sender);
+    }
+
+    function _resetBuyoutState() internal {
+        // Clear previous buyout mappings
+        uint256 holderCount = holders.length();
+        for (uint256 i = 0; i < holderCount; i++) {
+            address holder = holders.at(i);
+            currentBuyout.escrowedFractions[holder] = 0;
+            currentBuyout.refundAmounts[holder] = 0;
+        }
     }
 
     function getTimeWeightedBalance(
@@ -340,6 +441,27 @@ contract FractionToken is
         );
     }
 
+    function getHolders() external view returns (address[] memory) {
+        uint256 length = holders.length();
+        address[] memory holderList = new address[](length);
+        for (uint256 i = 0; i < length; i++) {
+            holderList[i] = holders.at(i);
+        }
+        return holderList;
+    }
+
+    function getAssetAttributes()
+        external
+        view
+        returns (string[] memory keys, string[] memory values)
+    {
+        keys = attributeKeys;
+        values = new string[](keys.length);
+        for (uint256 i = 0; i < keys.length; i++) {
+            values[i] = assetAttributes[keys[i]];
+        }
+    }
+
     function _update(
         address from,
         address to,
@@ -350,12 +472,22 @@ contract FractionToken is
             uint256 timePassed = block.timestamp - lastTransferTime[from];
             timeWeightedBalance[from] += balanceOf(from) * timePassed;
             lastTransferTime[from] = block.timestamp;
+
+            // Remove from holders if balance becomes zero
+            if (balanceOf(from) == amount) {
+                holders.remove(from);
+            }
         }
 
         if (to != address(0)) {
             uint256 timePassed = block.timestamp - lastTransferTime[to];
             timeWeightedBalance[to] += balanceOf(to) * timePassed;
             lastTransferTime[to] = block.timestamp;
+
+            // Add to holders if new holder
+            if (balanceOf(to) == 0) {
+                holders.add(to);
+            }
         }
 
         super._update(from, to, amount);
@@ -375,5 +507,18 @@ contract FractionToken is
         uint256 amount
     ) public override notPaused returns (bool) {
         return super.transferFrom(from, to, amount);
+    }
+
+    // Emergency functions
+    function emergencyWithdraw() external onlyOwner whenPaused {
+        uint256 balance = address(this).balance;
+        if (balance > 0) {
+            (bool success, ) = payable(owner()).call{value: balance}("");
+            require(success, "Emergency withdraw failed");
+        }
+    }
+
+    receive() external payable {
+        // Allow contract to receive ETH for royalty deposits
     }
 }
